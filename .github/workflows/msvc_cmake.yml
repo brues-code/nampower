@@ -23,11 +23,72 @@ jobs:
       with:
         arch: x86
 
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
     - name: Download hadesmem release
       shell: pwsh
       run: |
         Invoke-WebRequest https://github.com/namreeb/hadesmem/releases/download/v1.7.0/${{ env.HADESMEM_DIR }}.zip -OutFile hadesmem.zip
         Expand-Archive -Path hadesmem.zip -DestinationPath .
+
+    # The asmjit.lib and udis86.lib shipped in the hadesmem prebuilt are compiled
+    # with /MD. We need them compiled with /MT so nampower.dll can statically link
+    # the CRT and run on machines without the VC++ redist. Rebuild from upstream
+    # source at the exact commits namreeb pinned in his v1.7.0 submodules.
+    - name: Rebuild asmjit and udis86 with /MT
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        git clone https://github.com/asmjit/asmjit asmjit-src
+        git -C asmjit-src checkout f7de7b8d35c76e2a5f5792971371a9fd39e6557b
+
+        git clone https://github.com/vmt/udis86 udis86-src
+        git -C udis86-src checkout 0dc7184bd33b9f2866a2a95acf17b308466a1116
+
+        python udis86-src/scripts/ud_itab.py udis86-src/docs/x86/optable.xml udis86-src/libudis86
+
+        $cflags = @(
+          '/c','/MT','/O2','/GS-','/DNDEBUG','/D_LIB','/DWIN32',
+          '/D_CRT_SECURE_NO_WARNINGS','/wd4503','/wd4345',
+          '/Zc:strictStrings','/volatile:iso','/Gw','/Gy','/nologo'
+        )
+
+        # asmjit
+        New-Item -ItemType Directory build_asmjit | Out-Null
+        Push-Location build_asmjit
+        $asmjitDefs = @('/DASMJIT_STATIC','/DASMJIT_BUILD_X86','/DASMJIT_BUILD_X64')
+        $asmjitInc  = @('/I', '../asmjit-src/src')
+        $asmjitCpps = Get-ChildItem ../asmjit-src/src/asmjit -Recurse -Include *.cpp |
+                      Where-Object { $_.FullName -match '\\(base|x86)\\' }
+        & cl.exe @cflags @asmjitDefs @asmjitInc @($asmjitCpps.FullName)
+        if ($LASTEXITCODE -ne 0) { throw "asmjit compile failed" }
+        $asmObjs = (Get-ChildItem *.obj).FullName
+        & lib.exe /nologo /OUT:asmjit.lib @asmObjs
+        if ($LASTEXITCODE -ne 0) { throw "asmjit lib failed" }
+        Pop-Location
+
+        # udis86
+        New-Item -ItemType Directory build_udis86 | Out-Null
+        Push-Location build_udis86
+        $udis86Inc = @('/I','../udis86-src','/I','../udis86-src/libudis86')
+        $udis86Srcs = 'decode.c','itab.c','syn-att.c','syn-intel.c','syn.c','udis86.c' |
+                      ForEach-Object { "../udis86-src/libudis86/$_" }
+        & cl.exe @cflags @udis86Inc /TC @udis86Srcs
+        if ($LASTEXITCODE -ne 0) { throw "udis86 compile failed" }
+        $udObjs = (Get-ChildItem *.obj).FullName
+        & lib.exe /nologo /OUT:udis86.lib @udObjs
+        if ($LASTEXITCODE -ne 0) { throw "udis86 lib failed" }
+        Pop-Location
+
+        Copy-Item -Force build_asmjit/asmjit.lib   ${{ env.HADESMEM_DIR }}/lib/asmjit.lib
+        Copy-Item -Force build_udis86/udis86.lib   ${{ env.HADESMEM_DIR }}/lib/udis86.lib
+
+        Write-Host "Replaced /MD libs with /MT:"
+        Get-Item ${{ env.HADESMEM_DIR }}/lib/asmjit.lib, ${{ env.HADESMEM_DIR }}/lib/udis86.lib
 
     - name: Download Boost
       shell: pwsh
@@ -44,7 +105,7 @@ jobs:
         popd
         copy /Y tools\build\src\engine\b2.exe . || exit /b 1
         echo using msvc : 14.3 : "%VCToolsInstallDir%bin\Hostx86\x86\cl.exe" : ^<setup^>"%VCINSTALLDIR%Auxiliary\Build\vcvarsall.bat" ; > project-config.jam
-        .\b2.exe --with-filesystem --with-program_options link=static threading=multi runtime-link=shared architecture=x86 address-model=32 variant=release stage || exit /b 1
+        .\b2.exe --with-filesystem --with-program_options link=static threading=multi runtime-link=static architecture=x86 address-model=32 variant=release stage || exit /b 1
 
     - name: Configure CMake
       run: cmake -A Win32 -B ${{ github.workspace }}/build -DBOOST_ROOT=${{ github.workspace }}/boost_${{ env.BOOST_VERSION }} -DBOOST_INCLUDEDIR=${{ github.workspace }}/boost_${{ env.BOOST_VERSION }} -DBOOST_LIBRARYDIR=${{ github.workspace }}/boost_${{ env.BOOST_VERSION }}/stage/lib -DHADESMEM_ROOT=${{ github.workspace }}/${{ env.HADESMEM_DIR }} -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/artifact

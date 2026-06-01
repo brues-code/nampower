@@ -2,11 +2,15 @@ cmake_minimum_required(VERSION 3.12)
 
 foreach(policy
         CMP0074 # CMake 3.12
+        CMP0091 # CMake 3.15 - MSVC runtime selected via CMAKE_MSVC_RUNTIME_LIBRARY
 )
     if(POLICY ${policy})
         cmake_policy(SET ${policy} NEW)
     endif()
 endforeach()
+
+# Statically link the CRT so the produced binaries don't need the VC++ redist.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
