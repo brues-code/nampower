@@ -43,13 +43,17 @@ jobs:
       run: |
         $ErrorActionPreference = 'Stop'
 
-        git clone https://github.com/asmjit/asmjit asmjit-src
-        git -C asmjit-src checkout f7de7b8d35c76e2a5f5792971371a9fd39e6557b
+        # Pull the exact asmjit + udis86 commits hadesmem v1.7.0 pins. The
+        # udis86 commit (2022 Python-3 fix) is not on any branch in upstream
+        # vmt/udis86, so a direct clone+checkout won't reach it. Cloning
+        # hadesmem and letting `submodule update` resolve the pins is robust.
+        git clone --depth 1 --branch v1.7.0 https://github.com/namreeb/hadesmem hadesmem-src
+        git -C hadesmem-src submodule update --init --depth 1 deps/asmjit deps/udis86
 
-        git clone https://github.com/vmt/udis86 udis86-src
-        git -C udis86-src checkout 0dc7184bd33b9f2866a2a95acf17b308466a1116
+        $asmjitSrc = "hadesmem-src/deps/asmjit/asmjit/src"
+        $udis86Root = "hadesmem-src/deps/udis86/udis86"
 
-        python udis86-src/scripts/ud_itab.py udis86-src/docs/x86/optable.xml udis86-src/libudis86
+        python "$udis86Root/scripts/ud_itab.py" "$udis86Root/docs/x86/optable.xml" "$udis86Root/libudis86"
 
         $cflags = @(
           '/c','/MT','/O2','/GS-','/DNDEBUG','/D_LIB','/DWIN32',
@@ -61,8 +65,8 @@ jobs:
         New-Item -ItemType Directory build_asmjit | Out-Null
         Push-Location build_asmjit
         $asmjitDefs = @('/DASMJIT_STATIC','/DASMJIT_BUILD_X86','/DASMJIT_BUILD_X64')
-        $asmjitInc  = @('/I', '../asmjit-src/src')
-        $asmjitCpps = Get-ChildItem ../asmjit-src/src/asmjit -Recurse -Include *.cpp |
+        $asmjitInc  = @('/I', "../$asmjitSrc")
+        $asmjitCpps = Get-ChildItem "../$asmjitSrc/asmjit" -Recurse -Include *.cpp |
                       Where-Object { $_.FullName -match '\\(base|x86)\\' }
         & cl.exe @cflags @asmjitDefs @asmjitInc @($asmjitCpps.FullName)
         if ($LASTEXITCODE -ne 0) { throw "asmjit compile failed" }
@@ -74,9 +78,9 @@ jobs:
         # udis86
         New-Item -ItemType Directory build_udis86 | Out-Null
         Push-Location build_udis86
-        $udis86Inc = @('/I','../udis86-src','/I','../udis86-src/libudis86')
+        $udis86Inc = @('/I',"../$udis86Root",'/I',"../$udis86Root/libudis86")
         $udis86Srcs = 'decode.c','itab.c','syn-att.c','syn-intel.c','syn.c','udis86.c' |
-                      ForEach-Object { "../udis86-src/libudis86/$_" }
+                      ForEach-Object { "../$udis86Root/libudis86/$_" }
         & cl.exe @cflags @udis86Inc /TC @udis86Srcs
         if ($LASTEXITCODE -ne 0) { throw "udis86 compile failed" }
         $udObjs = (Get-ChildItem *.obj).FullName
