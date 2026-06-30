@@ -2,11 +2,15 @@ cmake_minimum_required(VERSION 3.12)
 
 foreach(policy
         CMP0074 # CMake 3.12
+        CMP0091 # CMake 3.15 - MSVC runtime selected via CMAKE_MSVC_RUNTIME_LIBRARY
 )
     if(POLICY ${policy})
         cmake_policy(SET ${policy} NEW)
     endif()
 endforeach()
+
+# Statically link the CRT so the produced binaries don't need the VC++ redist.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,15 +25,23 @@ project(${PROJECT_NAME})
 if( NOT CMAKE_BUILD_TYPE )
     set(CMAKE_BUILD_TYPE "RelWithDebInfo")
 endif()
-set(BOOST_ROOT "C:/software/boost_1_80_0/boost")
-set(BOOST_INCLUDEDIR "C:/software/boost_1_80_0")
-set(BOOST_LIBRARYDIR "C:/software/boost_1_80_0/lib32-msvc-14.3")
+if(NOT DEFINED BOOST_ROOT)
+    set(BOOST_ROOT "C:/software/boost_1_80_0/boost")
+endif()
+if(NOT DEFINED BOOST_INCLUDEDIR)
+    set(BOOST_INCLUDEDIR "C:/software/boost_1_80_0")
+endif()
+if(NOT DEFINED BOOST_LIBRARYDIR)
+    set(BOOST_LIBRARYDIR "C:/software/boost_1_80_0/lib32-msvc-14.3")
+endif()
 set (Boost_DETAILED_FAILURE_MSG ON)
 set (Boost_DEBUG ON)
 
 set(Boost_USE_STATIC_LIBS ON)
 set(Boost_USE_MULTITHREADED ON)
-set(Boost_USE_STATIC_RUNTIME OFF)
+# We statically link the CRT (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded), so
+# pick the boost libs built with runtime-link=static (the -mt-s-x32- variant).
+set(Boost_USE_STATIC_RUNTIME ON)
 
 find_package(Boost REQUIRED COMPONENTS filesystem program_options)
 
@@ -40,12 +52,16 @@ else()
 endif()
 
 if ("x_${CMAKE_BUILD_TYPE}" STREQUAL "x_Debug")
-    set(HADESMEM_ROOT "C:/software/hadesmem-v142-Debug-Win32")
     set(HADESMEM_BUILD "Debug")
+    if(NOT DEFINED HADESMEM_ROOT)
+        set(HADESMEM_ROOT "C:/software/hadesmem-v142-Debug-Win32")
+    endif()
     link_directories("${Boost_LIBRARY_DIR_DEBUG}")
 else()
-    set(HADESMEM_ROOT "C:/software/hadesmem-v142-Release-Win32")
     set(HADESMEM_BUILD "Release")
+    if(NOT DEFINED HADESMEM_ROOT)
+        set(HADESMEM_ROOT "C:/software/hadesmem-v142-Release-Win32")
+    endif()
     link_directories("${Boost_LIBRARY_DIR_RELEASE}")
 endif()
 
@@ -89,12 +105,8 @@ include_directories(
 
 link_directories("${HADESMEM_LIB_DIR}")
 
-# Set static runtime library
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd")
-
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB:MSVCRT /NODEFAULTLIB:MSVCRTD")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /NODEFAULTLIB:MSVCRT /NODEFAULTLIB:MSVCRTD")
+# Use dynamic CRT (/MD) to match the prebuilt hadesmem libs (asmjit, udis86)
+# which ship pre-compiled with dynamic runtime linkage.
 
 # Link static libraries
 add_subdirectory(loader)

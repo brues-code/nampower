@@ -3,54 +3,154 @@ name: CMake
 on:
   push:
 
+permissions:
+  contents: write
+
 env:
   BUILD_TYPE: Release
+  BOOST_VERSION: 1_80_0
+  HADESMEM_DIR: hadesmem-v142-Release-Win32
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+
+    - name: Set up MSVC (x86)
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
 
     - name: Download hadesmem release
+      shell: pwsh
       run: |
-        Invoke-WebRequest https://github.com/namreeb/hadesmem/releases/download/v1.7.0/hadesmem-v142-Release-Win32.zip -OutFile hadesmem.zip
+        Invoke-WebRequest https://github.com/namreeb/hadesmem/releases/download/v1.7.0/${{ env.HADESMEM_DIR }}.zip -OutFile hadesmem.zip
         Expand-Archive -Path hadesmem.zip -DestinationPath .
 
-    - name: Build Boost
+    # The asmjit.lib and udis86.lib shipped in the hadesmem prebuilt are compiled
+    # with /MD. We need them compiled with /MT so nampower.dll can statically link
+    # the CRT and run on machines without the VC++ redist. Rebuild from upstream
+    # source at the exact commits namreeb pinned in his v1.7.0 submodules.
+    - name: Rebuild asmjit and udis86 with /MT
+      shell: pwsh
       run: |
-        Invoke-WebRequest https://boostorg.jfrog.io/artifactory/main/release/1.78.0/source/boost_1_78_0.zip -OutFile boost.zip
+        $ErrorActionPreference = 'Stop'
+
+        # Pull the exact asmjit + udis86 commits hadesmem v1.7.0 pins. The
+        # udis86 commit (2022 Python-3 fix) is not on any branch in upstream
+        # vmt/udis86, so a direct clone+checkout won't reach it. Cloning
+        # hadesmem and letting `submodule update` resolve the pins is robust.
+        git clone --depth 1 --branch v1.7.0 https://github.com/namreeb/hadesmem hadesmem-src
+        git -C hadesmem-src submodule update --init --depth 1 deps/asmjit deps/udis86
+
+        $asmjitSrc = "hadesmem-src/deps/asmjit/asmjit/src"
+        $udis86Root = "hadesmem-src/deps/udis86/udis86"
+
+        python "$udis86Root/scripts/ud_itab.py" "$udis86Root/docs/x86/optable.xml" "$udis86Root/libudis86"
+
+        $cflags = @(
+          '/c','/MT','/O2','/GS-','/DNDEBUG','/D_LIB','/DWIN32',
+          '/D_CRT_SECURE_NO_WARNINGS','/wd4503','/wd4345',
+          '/Zc:strictStrings','/volatile:iso','/Gw','/Gy','/nologo'
+        )
+
+        # asmjit
+        New-Item -ItemType Directory build_asmjit | Out-Null
+        Push-Location build_asmjit
+        $asmjitDefs = @('/DASMJIT_STATIC','/DASMJIT_BUILD_X86','/DASMJIT_BUILD_X64')
+        $asmjitInc  = @('/I', "../$asmjitSrc")
+        $asmjitCpps = Get-ChildItem "../$asmjitSrc/asmjit" -Recurse -Include *.cpp |
+                      Where-Object { $_.FullName -match '\\(base|x86)\\' }
+        & cl.exe @cflags @asmjitDefs @asmjitInc @($asmjitCpps.FullName)
+        if ($LASTEXITCODE -ne 0) { throw "asmjit compile failed" }
+        $asmObjs = (Get-ChildItem *.obj).FullName
+        & lib.exe /nologo /OUT:asmjit.lib @asmObjs
+        if ($LASTEXITCODE -ne 0) { throw "asmjit lib failed" }
+        Pop-Location
+
+        # udis86
+        New-Item -ItemType Directory build_udis86 | Out-Null
+        Push-Location build_udis86
+        $udis86Inc = @('/I',"../$udis86Root",'/I',"../$udis86Root/libudis86")
+        $udis86Srcs = 'decode.c','itab.c','syn-att.c','syn-intel.c','syn.c','udis86.c' |
+                      ForEach-Object { "../$udis86Root/libudis86/$_" }
+        & cl.exe @cflags @udis86Inc /TC @udis86Srcs
+        if ($LASTEXITCODE -ne 0) { throw "udis86 compile failed" }
+        $udObjs = (Get-ChildItem *.obj).FullName
+        & lib.exe /nologo /OUT:udis86.lib @udObjs
+        if ($LASTEXITCODE -ne 0) { throw "udis86 lib failed" }
+        Pop-Location
+
+        Copy-Item -Force build_asmjit/asmjit.lib   ${{ env.HADESMEM_DIR }}/lib/asmjit.lib
+        Copy-Item -Force build_udis86/udis86.lib   ${{ env.HADESMEM_DIR }}/lib/udis86.lib
+
+        Write-Host "Replaced /MD libs with /MT:"
+        Get-Item ${{ env.HADESMEM_DIR }}/lib/asmjit.lib, ${{ env.HADESMEM_DIR }}/lib/udis86.lib
+
+    - name: Download Boost
+      shell: pwsh
+      run: |
+        Invoke-WebRequest https://archives.boost.io/release/1.80.0/source/boost_${{ env.BOOST_VERSION }}.zip -OutFile boost.zip
         Expand-Archive -Path boost.zip -DestinationPath .
-        cd boost_1_78_0
-        .\bootstrap
-        .\b2 --with-filesystem --with-program_options link=static threading=multi runtime-link=shared architecture=x86 address-model=32 stage
+
+    - name: Build Boost
+      shell: cmd
+      working-directory: boost_${{ env.BOOST_VERSION }}
+      run: |
+        pushd tools\build\src\engine
+        call build.bat vc143 || exit /b 1
+        popd
+        copy /Y tools\build\src\engine\b2.exe . || exit /b 1
+        echo using msvc : 14.3 : "%VCToolsInstallDir%bin\Hostx86\x86\cl.exe" : ^<setup^>"%VCINSTALLDIR%Auxiliary\Build\vcvarsall.bat" ; > project-config.jam
+        .\b2.exe --with-filesystem --with-program_options link=static threading=multi runtime-link=static architecture=x86 address-model=32 variant=release stage || exit /b 1
 
     - name: Configure CMake
-      run: cmake -A Win32 -B ${{github.workspace}}/build -DBOOST_ROOT=boost_1_78_0 -DHADESMEM_ROOT=hadesmem-v142-Release-Win32 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/artifact
+      run: cmake -A Win32 -B ${{ github.workspace }}/build -DBOOST_ROOT=${{ github.workspace }}/boost_${{ env.BOOST_VERSION }} -DBOOST_INCLUDEDIR=${{ github.workspace }}/boost_${{ env.BOOST_VERSION }} -DBOOST_LIBRARYDIR=${{ github.workspace }}/boost_${{ env.BOOST_VERSION }}/stage/lib -DHADESMEM_ROOT=${{ github.workspace }}/${{ env.HADESMEM_DIR }} -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/artifact
 
     - name: Build
       run: |
-        cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
-        cmake --install ${{github.workspace}}/build
+        cmake --build ${{ github.workspace }}/build --config ${{ env.BUILD_TYPE }}
+        cmake --install ${{ github.workspace }}/build
 
     - name: Publish artifact
-      uses: actions/upload-artifact@v3
-      with:	
-        name: artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nampower
         path: ${{ github.workspace }}/artifact/*
 
     - name: Setup release
-      working-directory: ${{env.GITHUB_WORKSPACE}}
       if: startsWith(github.ref, 'refs/tags/')
+      shell: pwsh
       run: |
-        move artifact nampower-${{ github.ref_name }}
+        $ErrorActionPreference = 'Stop'
+        Move-Item artifact nampower-${{ github.ref_name }}
+
+        # Bundle the companion NampowerSettings addon (a self-contained WoW addon)
+        # so the release ships the .dll and its in-game settings UI together. The
+        # addon vendors its own libs, so a plain checkout is the full package --
+        # we just strip repo/packaging metadata that shouldn't reach end users.
+        $addon = "nampower-${{ github.ref_name }}/NampowerSettings"
+        git clone --depth 1 https://github.com/brues-code/NampowerSettings $addon
+        if ($LASTEXITCODE -ne 0) { throw "NampowerSettings checkout failed" }
+        Remove-Item -Recurse -Force `
+          "$addon/.git","$addon/.github","$addon/.pkgmeta","$addon/README.md","$addon/img.png" `
+          -ErrorAction SilentlyContinue
+
         Compress-Archive nampower-${{ github.ref_name }} nampower-${{ github.ref_name }}.zip
 
-    - uses: softprops/action-gh-release@v1
+    - uses: softprops/action-gh-release@v2
       name: Upload assets to release
       if: startsWith(github.ref, 'refs/tags/')
       with:
         draft: true
-        files: nampower-${{ github.ref_name }}.zip
+        files: |
+          nampower-${{ github.ref_name }}.zip
+          nampower-${{ github.ref_name }}/nampower.dll
         fail_on_unmatched_files: true

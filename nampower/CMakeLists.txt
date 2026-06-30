@@ -66,14 +66,6 @@ set(SOURCE_FILES
 add_library(${DLL_NAME} SHARED ${SOURCE_FILES})
 target_link_libraries(${DLL_NAME} shlwapi.lib asmjit.lib udis86.lib)
 
-# Link appropriate VC runtime library based on build type
-target_link_libraries(${DLL_NAME}
-    $<$<CONFIG:Debug>:libvcruntimed.lib>
-    $<$<CONFIG:Debug>:libucrtd.lib>
-    $<$<NOT:$<CONFIG:Debug>>:libvcruntime.lib>
-    $<$<NOT:$<CONFIG:Debug>>:libucrt.lib>
-)
-
 # Generate MAP file for debugging crashes
 target_link_options(${DLL_NAME} PRIVATE /MAP)
 
