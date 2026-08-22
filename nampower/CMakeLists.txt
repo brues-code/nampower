@@ -69,4 +69,13 @@ target_link_libraries(${DLL_NAME} shlwapi.lib asmjit.lib udis86.lib)
 # Generate MAP file for debugging crashes
 target_link_options(${DLL_NAME} PRIVATE /MAP)
 
+# Emit full debug symbols (PDB) even in Release so shipped crashes can be
+# symbolicated. /Zi produces the debug info; /DEBUG writes the PDB and stamps its
+# GUID into the DLL. /DEBUG defaults to /OPT:NOREF,NOICF, so re-enable
+# /OPT:REF,ICF to keep the same dead-code elimination and COMDAT folding as a
+# plain Release build (i.e. the symbols are added without bloating the binary).
+target_compile_options(${DLL_NAME} PRIVATE /Zi)
+target_link_options(${DLL_NAME} PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+
 install(TARGETS ${DLL_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}")
+install(FILES $<TARGET_PDB_FILE:${DLL_NAME}> DESTINATION "${CMAKE_INSTALL_PREFIX}")
