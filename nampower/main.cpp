@@ -65,8 +65,6 @@
 #include <windows.h>
 #include <sys/stat.h>
 
-BOOL WINAPI DllMain(HINSTANCE, uint32_t, void *);
-
 namespace Nampower {
     uint32_t gLastErrorTimeMs;
     uint32_t gLastBufferIncreaseTimeMs;
@@ -105,83 +103,105 @@ namespace Nampower {
     CastQueue gCastHistory = CastQueue(30);
 
 
-    std::unique_ptr<hadesmem::PatchDetour<WowSysMessageOutputInitializeT> > gSysMsgInitDetour;
-    std::unique_ptr<hadesmem::PatchDetour<LoadScriptFunctionsT> > gLoadScriptFunctionsDetour;
-    std::unique_ptr<hadesmem::PatchDetour<FrameScript_CreateEventsT> > gCreateEventsDetour;
-    std::unique_ptr<hadesmem::PatchDetour<FramescriptSetEventCountT> > gSetEventCountDetour;
-    std::unique_ptr<hadesmem::PatchDetour<FrameScript_Object_RegisterScriptEventT> > gRegisterScriptEventDetour;
+    // Set by DllMain when the process is exiting: DLL_PROCESS_DETACH with a
+    // non-null reserved pointer. A FreeLibrary unload leaves it false.
+    bool gProcessExiting = false;
 
-    std::unique_ptr<hadesmem::PatchDetour<SetCVarT> > gSetCVarDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGSpellBook_CastSpellT> > gCGSpellBook_CastSpellDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_CastSpellT> > gCastDetour;
-    std::unique_ptr<hadesmem::PatchDetour<SendCastT> > gSendCastDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CancelSpellT> > gCancelSpellDetour;
-    std::unique_ptr<hadesmem::PatchDetour<SignalEventT> > gSignalEventDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_SpellFailedT> > gSpellFailedDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_GetSpellModifiersT> > gSpell_C_GetSpellModifiersDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_GetSpellRadiusT> > gSpell_C_GetSpellRadiusDetour;
-    std::unique_ptr<hadesmem::PatchRaw> gCastbarPatch;
-    std::unique_ptr<hadesmem::PatchDetour<ISceneEndT> > gIEndSceneDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_GetAutoRepeatingSpellT> > gSpell_C_GetAutoRepeatingSpellDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_CooldownEventTriggeredT> > gSpell_C_CooldownEventTriggeredDetour;
-    std::unique_ptr<hadesmem::PatchDetour<SpellGoT> > gSpellGoDetour;
-    std::unique_ptr<hadesmem::PatchDetour<LuaScriptT> > gSpellTargetUnitDetour;
-    std::unique_ptr<hadesmem::PatchDetour<LuaScriptT> > gSpellStopCastingDetour;
-    std::unique_ptr<hadesmem::PatchDetour<OnSpriteRightClickT> > gOnSpriteRightClickDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_HandleSpriteClickT> > gSpell_C_HandleSpriteClickDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_HandleTerrainClickT> > gSpell_C_HandleTerrainClickDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGWorldFrame_OnLayerTrackTerrainT> > gCGWorldFrame_OnLayerTrackTerrainDetour;
-    std::unique_ptr<hadesmem::PatchDetour<Spell_C_TargetSpellT> > gSpell_C_TargetSpellDetour;
+    // Owns a patch like std::unique_ptr, but keeps it applied and alive when the
+    // process exits. Removing a hadesmem patch suspends the process and walks
+    // every thread on the system three times (SuspendedProcess and two
+    // VerifyPatchThreads), so removing all of them one by one held the exit for
+    // about 10 seconds. At exit Windows frees everything, and code that still
+    // runs may call a patched function, so nothing is removed or freed then.
+    template<typename T>
+    struct ExitKeptPatch : std::unique_ptr<T> {
+        using std::unique_ptr<T>::unique_ptr;
+        using std::unique_ptr<T>::operator=;
 
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellCooldownDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellDelayedDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gCastResultHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellFailedOtherHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellChannelStartHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellChannelUpdateHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gPlaySpellVisualHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellHealingLogHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellEnergizeLogHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gProcResistHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellLogMissHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<PacketHandlerT> > gSpellOrDamageImmuneHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<UnitCombatLogDispelledT> > gUnitCombatLogDispelledDetour;
+        ~ExitKeptPatch() {
+            if (gProcessExiting) {
+                this->release();
+            }
+        }
+    };
 
-    std::unique_ptr<hadesmem::PatchDetour<FastCallPacketHandlerT> > gSpellStartHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<FastCallPacketHandlerT> > gPeriodicAuraLogHandlerDetour;
-    std::unique_ptr<hadesmem::PatchDetour<FastCallPacketHandlerT> > gSpellNonMeleeDmgLogHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<WowSysMessageOutputInitializeT> > gSysMsgInitDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<LoadScriptFunctionsT> > gLoadScriptFunctionsDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<FrameScript_CreateEventsT> > gCreateEventsDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<FramescriptSetEventCountT> > gSetEventCountDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<FrameScript_Object_RegisterScriptEventT> > gRegisterScriptEventDetour;
 
-    std::unique_ptr<hadesmem::PatchDetour<CGPlayer_C_OnAttackIconPressedT> > gCGPlayer_C_OnAttackIconPressedDetour;
-    std::unique_ptr<hadesmem::PatchDetour<AttackRoundInfo_ReadPacketT> > gAttackRoundInfo_ReadPacketDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGActionBar_UseActionT> > gCGActionBar_UseActionDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGUnit_C_OnAuraRemovedT> > gCGUnit_C_OnAuraRemovedDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGUnit_C_OnAuraAddedT> > gCGUnit_C_OnAuraAddedDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGUnit_C_OnAuraStacksChangedT> > gCGUnit_C_OnAuraStacksChangedDetour;
-    std::unique_ptr<hadesmem::PatchDetour<UnitCombatLogUnitDeadT> > gUnitCombatLogUnitDeadDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGBuffBar_UpdateDurationT> > gCGBuffBar_UpdateDurationDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<SetCVarT> > gSetCVarDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGSpellBook_CastSpellT> > gCGSpellBook_CastSpellDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_CastSpellT> > gCastDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<SendCastT> > gSendCastDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CancelSpellT> > gCancelSpellDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<SignalEventT> > gSignalEventDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_SpellFailedT> > gSpellFailedDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_GetSpellModifiersT> > gSpell_C_GetSpellModifiersDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_GetSpellRadiusT> > gSpell_C_GetSpellRadiusDetour;
+    ExitKeptPatch<hadesmem::PatchRaw> gCastbarPatch;
+    ExitKeptPatch<hadesmem::PatchDetour<ISceneEndT> > gIEndSceneDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_GetAutoRepeatingSpellT> > gSpell_C_GetAutoRepeatingSpellDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_CooldownEventTriggeredT> > gSpell_C_CooldownEventTriggeredDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<SpellGoT> > gSpellGoDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<LuaScriptT> > gSpellTargetUnitDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<LuaScriptT> > gSpellStopCastingDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<OnSpriteRightClickT> > gOnSpriteRightClickDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_HandleSpriteClickT> > gSpell_C_HandleSpriteClickDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_HandleTerrainClickT> > gSpell_C_HandleTerrainClickDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGWorldFrame_OnLayerTrackTerrainT> > gCGWorldFrame_OnLayerTrackTerrainDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<Spell_C_TargetSpellT> > gSpell_C_TargetSpellDetour;
 
-    std::unique_ptr<hadesmem::PatchDetour<InvalidFunctionPtrCheckT> > gInvalidFunctionPtrCheckDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellCooldownDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellDelayedDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gCastResultHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellFailedOtherHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellChannelStartHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellChannelUpdateHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gPlaySpellVisualHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellHealingLogHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellEnergizeLogHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gProcResistHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellLogMissHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<PacketHandlerT> > gSpellOrDamageImmuneHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<UnitCombatLogDispelledT> > gUnitCombatLogDispelledDetour;
 
-    std::unique_ptr<hadesmem::PatchDetour<GetSpellSlotFromLuaT> > gGetSpellSlotFromLuaDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<FastCallPacketHandlerT> > gSpellStartHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<FastCallPacketHandlerT> > gPeriodicAuraLogHandlerDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<FastCallPacketHandlerT> > gSpellNonMeleeDmgLogHandlerDetour;
 
-    std::unique_ptr<hadesmem::PatchDetour<LuaScriptT> > gCSimpleFrame_GetNameDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGUnit_C_AddChatBubbleT> > gCGUnit_C_AddChatBubbleDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CSimpleTop_OnKeyDownT> > gCSimpleTop_OnKeyDownDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CSimpleTop_OnKeyUpT> > gCSimpleTop_OnKeyUpDetour;
-    std::unique_ptr<hadesmem::PatchDetour<GetGUIDFromNameT> > gGetGUIDFromNameDetour;
-    std::unique_ptr<hadesmem::PatchDetour<LuaScriptT> > gCastSpellByNameDetour;
-    std::unique_ptr<hadesmem::PatchDetour<LuaScriptT> > gSetRaidTargetDetour;
-    std::unique_ptr<hadesmem::PatchDetour<SendUnitSignalT> > gSendUnitSignalDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGPetInfo_SetPetT> > gCGPetInfo_SetPetDetour;
-    std::unique_ptr<hadesmem::PatchDetour<TogglePetSlotAutocastT> > gTogglePetSlotAutocastDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGPetInfo_GetPetSpellActionT> > gCGPetInfo_GetPetSpellActionDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGPetInfo_SendPetActionT> > gCGPetInfo_SendPetActionDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGGameUI_ShowCombatFeedbackT> > gCGGameUI_ShowCombatFeedbackDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGUnit_C_HandleEnvironmentDamageT> > gCGUnit_C_HandleEnvironmentDamageDetour;
-    std::unique_ptr<hadesmem::PatchDetour<UnitCombatLogDamageShieldT> > gUnitCombatLogDamageShieldDetour;
-    std::unique_ptr<hadesmem::PatchDetour<LoadScriptFunctionsT> > gGlueLoadScriptFunctionsDetour;
-    std::unique_ptr<hadesmem::PatchDetour<CGTooltip_SetItemT> > gCGTooltip_SetItemDetour;
-    std::unique_ptr<hadesmem::PatchDetour<SpellParserParseTextT> > gSpellParserParseTextDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGPlayer_C_OnAttackIconPressedT> > gCGPlayer_C_OnAttackIconPressedDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<AttackRoundInfo_ReadPacketT> > gAttackRoundInfo_ReadPacketDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGActionBar_UseActionT> > gCGActionBar_UseActionDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGUnit_C_OnAuraRemovedT> > gCGUnit_C_OnAuraRemovedDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGUnit_C_OnAuraAddedT> > gCGUnit_C_OnAuraAddedDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGUnit_C_OnAuraStacksChangedT> > gCGUnit_C_OnAuraStacksChangedDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<UnitCombatLogUnitDeadT> > gUnitCombatLogUnitDeadDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGBuffBar_UpdateDurationT> > gCGBuffBar_UpdateDurationDetour;
+
+    ExitKeptPatch<hadesmem::PatchDetour<InvalidFunctionPtrCheckT> > gInvalidFunctionPtrCheckDetour;
+
+    ExitKeptPatch<hadesmem::PatchDetour<GetSpellSlotFromLuaT> > gGetSpellSlotFromLuaDetour;
+
+    ExitKeptPatch<hadesmem::PatchDetour<LuaScriptT> > gCSimpleFrame_GetNameDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGUnit_C_AddChatBubbleT> > gCGUnit_C_AddChatBubbleDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CSimpleTop_OnKeyDownT> > gCSimpleTop_OnKeyDownDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CSimpleTop_OnKeyUpT> > gCSimpleTop_OnKeyUpDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<GetGUIDFromNameT> > gGetGUIDFromNameDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<LuaScriptT> > gCastSpellByNameDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<LuaScriptT> > gSetRaidTargetDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<SendUnitSignalT> > gSendUnitSignalDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGPetInfo_SetPetT> > gCGPetInfo_SetPetDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<TogglePetSlotAutocastT> > gTogglePetSlotAutocastDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGPetInfo_GetPetSpellActionT> > gCGPetInfo_GetPetSpellActionDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGPetInfo_SendPetActionT> > gCGPetInfo_SendPetActionDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGGameUI_ShowCombatFeedbackT> > gCGGameUI_ShowCombatFeedbackDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGUnit_C_HandleEnvironmentDamageT> > gCGUnit_C_HandleEnvironmentDamageDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<UnitCombatLogDamageShieldT> > gUnitCombatLogDamageShieldDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<LoadScriptFunctionsT> > gGlueLoadScriptFunctionsDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<CGTooltip_SetItemT> > gCGTooltip_SetItemDetour;
+    ExitKeptPatch<hadesmem::PatchDetour<SpellParserParseTextT> > gSpellParserParseTextDetour;
 
     // Flags for one-time initialization
     std::once_flag loadFlag;
@@ -2202,4 +2222,11 @@ extern "C" __declspec(dllexport) uint32_t Load() {
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
+}
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
+        Nampower::gProcessExiting = true;
+    }
+    return TRUE;
 }
